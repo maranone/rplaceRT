@@ -108,7 +108,7 @@ end function
 --> This example used by a .bat (Batch) file contains double %% use single when cmd
 path c:\ffmpeg\bin
 cd out
-ffmpeg -y -framerate 60 -r 1 -i img%%08d.png -pix_fmt yuv420p -movflags faststart -c:v hevc_nvenc c:\rplace\RT.mov
+ffmpeg -y -framerate 60 -r 1 -i img%%08d.pcx -pix_fmt yuv420p -movflags faststart -c:v hevc_nvenc c:\rplace\RT.mov
 
 Thanks to this post for canvas information:
 https://www.reddit.com/r/place/comments/txvk2d/rplace_datasets_april_fools_2022/
