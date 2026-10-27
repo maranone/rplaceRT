@@ -1,0 +1,802 @@
+#pragma once
+
+// jni.h must come first — openxr_platform.h references jobject
+#include <jni.h>
+
+#ifndef XR_USE_PLATFORM_ANDROID
+#define XR_USE_PLATFORM_ANDROID
+#endif
+#ifndef XR_USE_GRAPHICS_API_OPENGL_ES
+#define XR_USE_GRAPHICS_API_OPENGL_ES
+#endif
+
+#include <EGL/egl.h>
+#include <GLES3/gl3.h>
+#include <openxr/openxr.h>
+#include <openxr/openxr_platform.h>
+
+#include <atomic>
+#include <array>
+#include <chrono>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <random>
+#include <cstdint>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "button_map.h"
+#include "panel_layout.h"
+#include "emulator_backend.h"
+#include "experimental_rumble.h"
+#include "game_config.h"
+#include "gles_renderer.h"
+#include "layer_processor.h"
+#include "rom_browser.h"
+#include "vr_state.h"
+
+namespace qrd {
+
+// Called from the XR render thread to publish controller state and fetch the
+// latest emulator frame. The sequence is caller-owned; the provider only copies
+// FrameOutput when a newer frame is available.
+using FrameProvider = std::function<bool(FrameOutput&, EmulatorInputState&, uint64_t&)>;
+
+// Rising-edge-only controller callback for rplace playback controls (speed
+// up/down on the triggers, rewind on right grip). Fires from the same
+// "normal (game) mode" input branch that drives emulator button mapping, so
+// it only fires while the menu is closed -- see the call site's comment for
+// why edges (not held state) are reported.
+using RplaceInputHandler = std::function<void(bool rtrig_pressed, bool ltrig_pressed, bool rgrip_pressed, bool a_pressed)>;
+
+// Snapshot of RplaceCanvas playback stats for the controller HUD (see
+// m_rplace_stats_provider) -- pulled via a provider callback rather than a
+// direct global reference, matching how RplaceInputHandler/FrameProvider
+// already decouple this file from questretrodepth_main.cpp's rplace globals.
+struct RplaceHudStats {
+    int64_t epoch_ms = 0;          // real-world UTC ms for the current playback position
+    float   speed = 1.0f;
+    float   pixels_per_sec = 0.0f;
+    float   percent_complete = 0.0f; // 0-100
+    // Canvas-pixel-space centre the camera is currently looking at (derived
+    // from m_canvas_x/y/scale via the same pixel<->metre mapping the
+    // director uses -- see canvas_pixel_to_metres/metres_to_canvas_pixel in
+    // openxr_shell.cpp) -- Kotlin uses this to look up the nearest Place
+    // Atlas entry for the caption panel.
+    int32_t camera_center_x = 0;
+    int32_t camera_center_y = 0;
+    bool    director_active = false;
+    // RplaceCanvas::MomentReason of whichever moment the director reel is
+    // currently on (0 if director_active is false, or while it's still
+    // running the live-window fallback) -- Kotlin's atlas caption uses this
+    // as a fallback label when no Place Atlas entry actually covers this
+    // spot/time, so there's still an honest answer for "why are we here".
+    int32_t director_reason = 0;
+    // Ground-truth snapshot of the most recently painted pixel event (see
+    // RplaceCanvas::last_event_*()) -- shown verbatim on the right HUD panel
+    // so it can be compared against what's actually visible on the canvas,
+    // independent of where the camera/director happens to be pointed.
+    int64_t  last_event_epoch_ms = 0;
+    int32_t  last_event_x = 0;
+    int32_t  last_event_y = 0;
+    uint32_t last_event_color_bgra = 0;
+};
+using RplaceStatsProvider = std::function<RplaceHudStats()>;
+
+// Live auto-director target, in canvas-pixel space -- see RplaceCanvas's
+// director_target_x/y/viewport_px() doc comments (rplace_canvas.h). Queried
+// alongside RplaceStatsProvider so the camera lerp (see m_rplace_mode_active's
+// stick-input block in openxr_shell.cpp) and the HUD's camera_center_x/y
+// share one source of truth.
+struct RplaceDirectorTarget {
+    bool enabled = false;
+    int32_t target_x = 0;
+    int32_t target_y = 0;
+    int32_t viewport_px = 0; // desired canvas-pixel width visible on screen
+    int32_t reason = 0; // RplaceCanvas::MomentReason of the active reel moment -- see RplaceHudStats::director_reason
+};
+using RplaceDirectorProvider = std::function<RplaceDirectorTarget()>;
+
+enum class LayerFilterMode {
+    ShowAll = 0,
+    Z       = 1,
+    Per     = 2,
+    Hybrid  = 3,
+};
+
+struct SaveStateSlotInfo {
+    bool occupied = false;
+    std::string label;
+    std::uint64_t timestamp_epoch_seconds = 0;
+};
+
+class OpenXrShell {
+public:
+    OpenXrShell() = default;
+    ~OpenXrShell();
+
+    bool start(JavaVM* vm, JNIEnv* env, jobject activity, bool open_menu_on_startup,
+               int autosave_interval_seconds, bool load_last_save_enabled,
+               std::string& status_out);
+    bool start_headless(JavaVM* vm, JNIEnv* env, jobject activity,
+                        int autosave_interval_seconds, bool load_last_save_enabled,
+                        std::string& status_out);
+    void stop(JNIEnv* env);
+    std::string status() const;
+    void set_frame_provider(FrameProvider provider);
+    // Switches to a single full-frame layer sized for an arbitrary RGBA source
+    // (e.g. the rplace canvas) and closes the menu so the screen becomes
+    // visible -- mirrors what a normal ROM load does (see the m_menu_open /
+    // m_config wiring around RomLoader success in openxr_shell.cpp), since
+    // rplace playback never goes through the emulator ROM-load path.
+    void activate_flat_frame(int width, int height);
+    void set_rplace_input_handler(RplaceInputHandler handler);
+    void set_rplace_stats_provider(RplaceStatsProvider provider);
+    void set_rplace_director_provider(RplaceDirectorProvider provider);
+    // See m_screen_layer_respects_alpha's declaration comment.
+    void set_screen_layer_respects_alpha(bool respects) { m_screen_layer_respects_alpha = respects; }
+    // The Y-depth render path (uYDepthTex, see gles_renderer.cpp) that drives
+    // rplace's 5-tier "pixel settles onto canvas" animation is gated behind
+    // VrState::sprite_y_depth, a per-game settings toggle that's off by
+    // default (it's meant for retro sprite depth, not this) -- without this,
+    // RplaceCanvas's m_canvas_age tiers are computed correctly but never
+    // actually sampled by the shader, so nothing visibly moves. Saves the
+    // user's existing toggle/spread so leaving rplace for a real ROM doesn't
+    // leave sprite depth force-enabled behind their back.
+    void enable_rplace_depth_effect();
+    void restore_depth_effect();
+    void request_open_main_menu();
+    void request_open_homebrew();
+    void mobile_open_main_menu();
+    void mobile_open_quick_edit();
+    bool mobile_panel_visible() const;
+    int mobile_panel_generation() const;
+    bool mobile_copy_current_panel_argb(std::vector<uint32_t>& argb_out, int& width_out, int& height_out) const;
+    void mobile_refresh_visible_panel();
+    void mobile_tap(float u, float v);
+    void mobile_scroll(int delta);
+    bool mobile_back();
+    void export_mobile_visual_state(
+        VrState& vr_state_out,
+        GameConfig& config_out,
+        std::vector<std::string>& layer_names_out,
+        std::vector<int>& layer_order_out,
+        std::vector<bool>& layer_enabled_out,
+        std::vector<bool>& layer_ambilight_out,
+        int& layer_auto_dup_percent_out,
+        BackendKind& backend_kind_out) const;
+    void import_mobile_visual_state(
+        const VrState& vr_state_in,
+        const GameConfig& config_in,
+        const std::vector<std::string>& layer_names_in,
+        const std::vector<int>& layer_order_in,
+        const std::vector<bool>& layer_enabled_in,
+        const std::vector<bool>& layer_ambilight_in,
+        int layer_auto_dup_percent_in,
+        BackendKind backend_kind_in);
+
+    // Thread-safe: schedule a randomise on the next XR frame
+    void randomize();
+    // Called by ROM loader to update the active game name (used for per-game settings)
+    void set_current_rom(const std::string& rom_filename); // e.g. "Chrono Trigger.sfc"
+    void load_preset(int idx);
+    void save_preset(int idx);
+    void submit_quick_preset_name(int kind, int slot, const std::string& name);
+    void cancel_quick_preset_name(int kind, int slot);
+    std::string vr_state_summary() const;
+
+    // Share-code: encode current state → 8-char string; decode & apply a code.
+    std::string get_state_code() const;
+    // Returns true on success; false if the code is malformed.
+    bool apply_state_code(const std::string& code);
+
+    // Set callback invoked on the XR thread when the user picks a ROM.
+    using RomLoader = std::function<bool(const std::string&, std::string&)>;
+    void set_rom_loader(RomLoader loader) {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        m_rom_loader = std::move(loader);
+    }
+
+    // Emulator freeze control: called from XR thread to pause/resume the emu thread,
+    // and to step exactly one frame (so layers refresh when settings change while frozen).
+    using EmuFreezeCtrl = std::function<void(bool freeze)>; // true=freeze, false=unfreeze
+    using EmuStepOne    = std::function<void()>;            // step one frame then re-freeze
+    void set_emu_freeze_ctrl(EmuFreezeCtrl fn) {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        m_emu_freeze_ctrl = std::move(fn);
+    }
+    void set_emu_step_one(EmuStepOne fn) {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        m_emu_step_one = std::move(fn);
+    }
+    using LayerCaptureMaskCtrl = std::function<void(uint32_t mask)>;
+    void set_layer_capture_mask_ctrl(LayerCaptureMaskCtrl fn) {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        m_layer_capture_mask_ctrl = std::move(fn);
+    }
+    using SaveStateCapture = std::function<bool(std::vector<uint8_t>&, std::string&)>;
+    using SaveStateApply = std::function<bool(const void*, std::size_t, std::string&)>;
+    void set_save_state_capture(SaveStateCapture fn) {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        m_save_state_capture = std::move(fn);
+    }
+    void set_save_state_apply(SaveStateApply fn) {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        m_save_state_apply = std::move(fn);
+    }
+    using VrStateChanged = std::function<void(bool auto_frame_skip, int audio_spatial_mode)>;
+    void set_on_vr_state_changed(VrStateChanged fn) {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        m_on_vr_state_changed = std::move(fn);
+    }
+    using ExperimentalRumbleChanged = std::function<void(bool enabled)>;
+    void set_on_experimental_rumble_changed(ExperimentalRumbleChanged fn) {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        m_on_experimental_rumble_changed = std::move(fn);
+    }
+
+    void set_current_backend_kind(BackendKind kind);
+    void set_current_game_name(const std::string& name);
+    void enqueue_haptic(bool right, float amplitude, int duration_ms);
+    void enqueue_haptic(const QueuedHapticEvent& event);
+    void set_experimental_rumble_status(const std::string& status);
+
+    struct QuickSettingsPreset {
+        std::string name;
+        float canvas_x = 0.0f;
+        float canvas_y = 0.0f;
+        float canvas_az = 0.0f;
+        float canvas_el = 0.0f;
+        float canvas_scale = 1.0f;
+        float near_depth = 1.0f;
+        float far_depth = 1.8f;
+        float quad_width = 2.56f;
+        int copy_count = 1;
+        bool immersive_beta_enabled = false;
+        bool upscale = false;
+        bool ambilight = true;
+        bool passthrough = false;
+        DepthMode depth_mode = DepthMode::Off;
+        bool layers_3d = false;
+        float gamma = 1.08f;
+        float contrast = 0.85f;
+        float saturation = 0.80f;
+        float brightness = 1.00f;
+        bool perspective_comp = true;
+        EnvironmentSphereMode environment_sphere_mode = EnvironmentSphereMode::Off;
+    };
+
+    struct QuickLayerPreset {
+        std::string name;
+        std::vector<std::string> ordered_ids;
+        std::vector<bool> enabled;
+        std::vector<bool> ambilight;
+        std::vector<float> depths;
+    };
+
+    struct EnvironmentSphereSample {
+        bool valid = false;
+        std::array<std::array<float, 4>, 12> bands{};
+    };
+
+    enum class BlackoutRevealPhase {
+        Normal = 0,
+        BlackoutLatched,
+        RevealAnimating,
+        RevealCooldown,
+    };
+
+    struct MobilePanelBitmap {
+        int width = 0;
+        int height = 0;
+        int generation = 0;
+        std::vector<uint8_t> rgba;
+    };
+
+    void homebrew_data_ready()        { m_hw_loading = false;     m_hw_dirty = true; }
+    void homebrew_download_complete() { m_hw_downloading = false; m_hw_dirty = true; }
+    void set_homebrew_feed(int idx)   { m_hw_feed = idx < 0 ? 0 : idx; m_hw_loading = true; m_hw_dirty = true; m_hw_view = 0; m_hw_hovered = -1; m_hw_scroll = 0; }
+
+private:
+    void set_status(const std::string& s);
+    bool start_common(JavaVM* vm, JNIEnv* env, jobject activity, bool open_menu_on_startup,
+                      int autosave_interval_seconds, bool load_last_save_enabled,
+                      bool start_xr_thread, std::string& status_out);
+
+    // ---------- init chain ----------
+    bool initialize_loader();
+    bool create_instance();
+    bool create_system();
+    bool create_graphics_context();
+    bool create_session();
+    bool create_reference_space();
+    bool create_swapchains();
+    void destroy_swapchains();
+    bool init_actions();
+    bool init_renderer();
+    bool init_passthrough();
+    void sync_passthrough_state();
+    bool passthrough_active() const;
+
+    // ---------- run loop ----------
+    void run();
+    void poll_events(bool& exit);
+    void poll_actions();
+    void render_frame(XrTime predicted_time);
+    void apply_pending_vr_changes();
+    void recenter_to_hmd();                    // snap canvas to current HMD gaze direction
+    void open_rom_menu();                      // scan ROMs + place main menu panel in front of HMD
+    void open_homebrew_panel(bool fetch_feed);
+    void open_quick_edit_panel();              // place quick edit panel in front of HMD
+    void enter_manual_edit_mode();             // enter controller-driven canvas edit mode
+    void apply_quick_settings_preset(int idx);
+    bool apply_quick_layer_preset(int idx, std::string& status_out);
+    void request_quick_settings_preset_save(int idx);
+    void request_quick_layer_preset_save(int idx);
+    void reset_quick_settings_presets();
+    void reset_quick_layer_presets();
+    void refresh_quick_layer_presets();
+    void rebuild_main_menu_texture();          // call Kotlin → upload GL texture for main menu
+    void rebuild_quick_edit_panel_texture();   // call Kotlin → upload GL texture for quick preset panel
+    void rebuild_layer_panel_texture();        // call Kotlin → upload GL texture
+    void rebuild_settings_panel_texture();     // call Kotlin → upload GL texture
+    void rebuild_save_state_panel_texture();   // call Kotlin → upload GL texture
+    void rebuild_code_panel_texture();         // call Kotlin → upload GL texture
+    void rebuild_ctrlmap_panel_texture();      // call Kotlin → upload GL texture
+    void rebuild_help_panel_texture();         // call Kotlin → upload GL texture
+    // Single merged stats panel (right controller only -- see its doc
+    // comment in openxr_shell.cpp for why the left one was removed).
+    void rebuild_rplace_hud_right_texture(const RplaceHudStats& stats); // call Kotlin → upload GL texture
+    // call Kotlin (does the atlas nearest-entry lookup itself) → upload GL
+    // texture, or hide the panel if Kotlin reports nothing nearby.
+    void rebuild_rplace_atlas_caption_texture(const RplaceHudStats& stats);
+    // Approximate canvas-pixel <-> world-metres mapping for the rplace flat
+    // frame, derived from the vertex shader's quad placement math (see
+    // gles_renderer.cpp: center.x = uCanvasX when az=0; quad spans
+    // +-0.5*uQuadW*uCanvasScale around that; uQuadW =
+    // quad_width_meters, taken from the cached rplace layer frame). Assumes
+    // az=el=0 and negligible cylindrical-wrap distortion (both true for
+    // rplace's default/typical camera state) -- an approximation, not exact,
+    // see docs/FORMAT_AND_DIRECTOR.md-adjacent plan notes: verify sign/scale
+    // on-device and tune if the director aims off-target or the atlas
+    // caption mismatches what's visibly centered.
+    float canvas_pixel_to_metres_x(int canvas_px, int canvas_width) const;
+    float canvas_pixel_to_metres_y(int canvas_px, int canvas_height) const;
+    int   metres_to_canvas_pixel_x(int canvas_width) const; // reads current m_canvas_x/scale
+    int   metres_to_canvas_pixel_y(int canvas_height) const; // reads current m_canvas_y/scale
+    // General inverse of canvas_pixel_to_metres_x/y: which canvas pixel
+    // currently sits at an arbitrary world-space point (not just world
+    // origin, unlike metres_to_canvas_pixel_x/y above) -- used by the
+    // left-hand laser raycast to find which pixel the ray is pointing at.
+    int   world_to_canvas_pixel_x(float world_x, int canvas_width) const;
+    int   world_to_canvas_pixel_y(float world_y, int canvas_height) const;
+    void rebuild_homebrew_panel_texture();     // call Kotlin → upload GL texture
+    void rebuild_dashboard_left_panel_texture(); // call Kotlin → upload GL texture for manual dashboard left panel
+    std::string get_settings_dir();            // call Kotlin → returns settings directory path
+    void save_settings(bool game_scope);       // save current state to disk
+    void load_settings(bool game_scope);       // load state from disk (if file exists)
+    void reset_settings();                     // reset to hardcoded defaults
+    void wipe_all_settings();                  // delete every saved .ini on disk + reset to defaults
+    void apply_layer_filter_mode(LayerFilterMode mode, bool restore_saved_state);
+    void sync_layer_capture_mask();
+    void refresh_save_state_slots();
+    bool save_state_to_slot(int slot, std::string& error_out);
+    bool load_state_from_slot(int slot, std::string& error_out);
+    bool save_state_to_path(const std::string& path, std::string& error_out);
+    bool load_state_from_path(const std::string& path, std::string& error_out);
+    bool try_load_latest_state(std::string& loaded_name_out, std::string& error_out, bool& found_any);
+    void persist_save_automation_settings();
+    void maybe_run_autosave();
+    void reset_emulation_cache_for_rom_change();
+    void flush_pending_haptics();
+    // right=true → right controller, false → left; amplitude 0-1, duration_ms
+    void fire_haptic(bool right, float amplitude = 0.4f, int duration_ms = 40);
+    void shutdown();
+    void mark_visual_state_dirty();
+    void refresh_mobile_panel_pose_defaults();
+
+    // ---------- Android / JNI ----------
+    JavaVM*  m_vm              = nullptr;
+    jobject  m_activity_global = nullptr;
+
+    std::thread        m_thread;
+    std::atomic<bool>  m_stop_requested{false};
+    std::atomic<bool>  m_running{false};
+
+    mutable std::mutex m_mutex;
+    std::string        m_status = "VR shell idle.";
+    FrameProvider      m_frame_provider;
+    RplaceInputHandler m_rplace_input_handler;
+    RplaceStatsProvider m_rplace_stats_provider;
+    RplaceDirectorProvider m_rplace_director_provider;
+    // Controller-attached HUD -- all stats merged onto one right-controller
+    // panel (see rebuild_rplace_hud_right_texture's doc comment). Texture is
+    // rebuilt via Kotlin, throttled by m_last_rplace_hud_update so a Canvas
+    // render + JNI round-trip doesn't happen every single XR frame for text
+    // that only needs to visibly tick a few times/second.
+    GLuint  m_rplace_hud_right_tex = 0;
+    bool    m_rplace_hud_right_dirty = true;
+    XrPosef m_rplace_hud_right_pose{{0,0,0,1},{0,0,0}};
+    std::chrono::steady_clock::time_point m_last_rplace_hud_update{};
+    static constexpr double kRplaceHudUpdateIntervalMs = 250.0;
+    bool m_rplace_rtrig_prev = false;
+    bool m_rplace_ltrig_prev = false;
+    bool m_rplace_rgrip_prev = false;
+    bool m_rplace_a_prev = false;
+    // Third HUD-style panel: names/describes whatever Place Atlas region the
+    // camera is currently near (see rebuild_rplace_atlas_caption_texture()).
+    // Shares the same refresh cadence/throttle as the stats HUD panels
+    // (m_last_rplace_hud_update) -- no separate timer needed.
+    GLuint  m_rplace_atlas_caption_tex = 0;
+    bool    m_rplace_atlas_caption_dirty = true;
+    bool    m_rplace_atlas_caption_visible = false; // false = nothing nearby, don't draw the quad
+    XrPosef m_rplace_atlas_caption_pose{{0,0,0,1},{0,0,0}};
+    // Second copy of the same caption texture, anchored above the left-hand
+    // HUD panel instead of the canvas -- lets the reader hold it close
+    // rather than reading it off in the distance at the bottom of the
+    // canvas. Same texture, different pose/panel entry (see
+    // add_rplace_atlas_caption_panel()'s two call sites).
+    XrPosef m_rplace_atlas_caption_hand_pose{{0,0,0,1},{0,0,0}};
+    // World-space quad size multipliers, read from Kotlin's
+    // rplaceAtlasCaptionWidthScale()/HeightScale() right after a successful
+    // rebuild_rplace_atlas_caption_texture() -- lets the panel grow/shrink
+    // to fit however much text the current entry has. 1.0 = base size.
+    float m_rplace_atlas_caption_w_scale = 1.0f;
+    float m_rplace_atlas_caption_h_scale = 1.0f;
+    // Director "pop-out" duplicate: a second quad sampling a CROPPED
+    // sub-rectangle of the SAME live canvas texture (see
+    // GlesRenderer::layer_texture(), PanelInfo::uv_u0 etc) as the target
+    // region the director is currently focused on, pulled dramatically
+    // closer to the viewer than the canvas plane so it reads as a real 3D
+    // pop-out rather than a flat overlay. No separate texture/JNI round-trip
+    // -- purely a second draw call against the already-uploaded canvas GL
+    // texture, computed fresh every frame in the stick-input block (same
+    // place the camera lerp itself lives). Hidden during the zoom-out-to-
+    // full-canvas travel phase and whenever the director is off.
+    bool  m_rplace_director_popout_visible = false;
+    XrPosef m_rplace_director_popout_pose{{0,0,0,1},{0,0,0}};
+    float m_rplace_director_popout_w = 0.0f;
+    float m_rplace_director_popout_h = 0.0f;
+    float m_rplace_director_popout_u0 = 0.0f, m_rplace_director_popout_v0 = 0.0f;
+    float m_rplace_director_popout_u1 = 1.0f, m_rplace_director_popout_v1 = 1.0f;
+    // Auto-hides kRplaceDirectorPopoutShowMs after first appearing for a
+    // given target -- long enough to register "look here", not so long it
+    // stays glued to your view for the whole hold. Reset whenever the
+    // target waypoint changes (see m_rplace_director_popout_target_x/y) or
+    // whenever the pop-out was hidden and becomes eligible again.
+    std::chrono::steady_clock::time_point m_rplace_director_popout_shown_since{};
+    int m_rplace_director_popout_target_x = -1, m_rplace_director_popout_target_y = -1;
+
+    // Left-hand laser pointer over the rplace canvas: shows the atlas
+    // caption for whatever the ray is actually pointing at (current
+    // playback time, not the canvas's final state) instead of always
+    // captioning whatever the camera happens to be centered on. Recomputed
+    // every frame in the stick-input block; hit_x/y are canvas-pixel space,
+    // same convention as RplaceHudStats::camera_center_x/y.
+    bool       m_rplace_laser_hit_valid = false;
+    int        m_rplace_laser_hit_x = 0, m_rplace_laser_hit_y = 0;
+    XrVector3f m_rplace_laser_origin{0, 0, 0};
+    XrVector3f m_rplace_laser_end{0, 0, 0};
+    // Last time the left/right stick moved past the pan/zoom deadzone while
+    // in rplace mode -- the director (see the stick-input block) only drives
+    // the camera once this is stale (a few seconds old), so manual input
+    // always wins immediately and the director resumes smoothly afterward
+    // rather than snapping.
+    std::chrono::steady_clock::time_point m_rplace_last_manual_input{};
+    static constexpr double kRplaceDirectorResumeDelayMs = 3000.0;
+    // True only while an rplace year is the active frame source -- gates the
+    // dedicated left/right-thumbstick pan+scale controls (NORMAL GAME MODE
+    // input block) so they don't interfere with a real emulator ROM's stick
+    // input. Set in activate_flat_frame(), cleared in restore_depth_effect()
+    // (only called from nativeRplaceStop).
+    bool m_rplace_mode_active = false;
+    // Normal ROM screens are always forced fully opaque while passthrough is
+    // active (uForceOpaqueAlpha in gles_renderer.cpp) so a retro game screen
+    // doesn't get transparent holes into the room -- only the *background
+    // around* the screen becomes see-through then. rplace wants the opposite:
+    // the canvas itself should show real passthrough through its unpainted
+    // (alpha=0) pixels. False = legacy/ROM behavior (default); set true by
+    // activate_flat_frame().
+    bool m_screen_layer_respects_alpha = false;
+    // Saved by enable_rplace_depth_effect(), restored by restore_depth_effect().
+    bool  m_saved_sprite_y_depth = false;
+    float m_saved_sprite_y_depth_spread = 0.5f;
+    VrStateChanged     m_on_vr_state_changed;
+    ExperimentalRumbleChanged m_on_experimental_rumble_changed;
+    float              m_active_refresh_rate = 0.0f;
+    float              m_last_render_ms      = 0.0f;
+    float              m_avg_render_ms       = 0.0f;
+    float              m_max_render_ms       = 0.0f;
+    uint64_t           m_render_sample_count = 0;
+
+    // ---------- VR state (accessed only from XR thread after init) ----------
+
+    GameConfig           m_config;
+    VrState              m_vr_state;
+    std::vector<VrState> m_presets;
+    std::mt19937         m_rng{std::random_device{}()};
+
+    // ---------- Main menu panel ----------
+    GLuint  m_main_menu_tex       = 0;
+    bool    m_main_menu_dirty     = true;
+    int     m_main_menu_hovered   = -1; // row under laser (-1=none)
+    XrTime  m_last_main_menu_fire = 0;
+    bool    m_wipe_settings_armed     = false; // first tap on "Wipe Settings" arms it
+    XrTime  m_wipe_settings_arm_time  = 0;     // arming expires after a few seconds
+
+    // ---------- ROM browser panel ----------
+    RomBrowser  m_rom_browser;
+    bool        m_menu_open  = false;
+    bool        m_headless_mode = false;
+    std::string m_settings_dir;       // cached path to settings directory
+    std::string m_current_rom_name;   // filename stem of currently loaded ROM (for per-game settings)
+    std::string m_current_game_name;  // from ROM header (0xFFC0+) for version fallback
+    BackendKind m_current_backend_kind = BackendKind::Snes;
+    bool        m_experimental_rumble_enabled = true;
+    std::string m_experimental_rumble_status = "OFF";
+
+    bool        m_menu_prev  = false;
+    bool        m_rtrig_prev = false;
+    std::string m_rom_dir;
+    XrTime      m_last_rom_fire = 0;  // throttle for ROM browser rebuilds
+
+    // Panel poses (set in open_rom_menu, index matches k_panel_* constants)
+    static constexpr int k_panel_main_menu  = 0;
+    static constexpr int k_panel_layers     = 1;
+    static constexpr int k_panel_browser    = 2;
+    static constexpr int k_panel_settings   = 3;
+    static constexpr int k_panel_save_state = 4;
+    static constexpr int k_panel_code       = 5;
+    static constexpr int k_panel_ctrlmap    = 6;
+    static constexpr int k_panel_quick_edit = 7;
+    static constexpr int k_panel_homebrew  = 8;
+    static constexpr int k_panel_manual_dashboard = 9;
+    XrPosef m_main_menu_pose       = {{0,0,0,1},{0,0,-1}};
+    XrPosef m_quick_panel_pose     = {{0,0,0,1},{0,0,-1}};
+    XrPosef m_panel_pose           = {{0,0,0,1},{0,0,-1}}; // browser (centre)
+    XrPosef m_layer_panel_pose     = {{0,0,0,1},{0,0,-1}};
+    XrPosef m_settings_panel_pose  = {{0,0,0,1},{0,0,-1}};
+    XrPosef m_save_state_panel_pose = {{0,0,0,1},{0,0,-1}};
+    XrPosef m_code_panel_pose      = {{0,0,0,1},{0,0,-1}};
+    XrPosef m_ctrlmap_panel_pose   = {{0,0,0,1},{0,0,-1}};
+    bool    m_ctrlmap_mode         = false; // true = showing ctrlmap panel only
+
+    XrPosef m_homebrew_panel_pose  = {{0,0,0,1},{0,0,-1}};
+
+    // ---------- Manual editor dashboard (wing-style placement) ----------
+    XrPosef m_dashboard_left_pose  = {{0,0,0,1},{0,0,-1}};  // left wing
+    XrPosef m_dashboard_right_pose = {{0,0,0,1},{0,0,-1}};  // right wing (layer panel on right)
+    GLuint  m_dashboard_left_panel_tex     = 0;
+    bool    m_dashboard_left_panel_dirty   = true;
+    int     m_dashboard_left_panel_hovered = -1; // row under laser
+    XrTime  m_last_dashboard_fire = 0;
+    PanelLayout m_dashboard_left_panel_layout;
+    // Non-persisted in-memory duplication spacing (copy_step) for dashboard UI
+    float   m_dashboard_duplication_spacing = 0.003f;
+
+    // Main menu / standalone panel tracking
+    // 0 = main menu, 1 = browser, 2 = layers, 3 = settings, 4 = save states, 5 = code, 6 = ctrlmap, 7 = quick edit, 8 = homebrew, 9 = manual dashboard
+    int     m_active_sub_panel     = 0;
+
+    // Multi-panel laser state (menu mode — right controller)
+    bool        m_laser_hit    = false;
+    XrVector3f  m_laser_origin = {0,0,0};
+    XrVector3f  m_laser_end    = {0,0,0};
+    int         m_laser_panel  = -1;  // which panel was hit (k_panel_*)
+    float       m_laser_hit_u  = 0.0f;
+    float       m_laser_hit_v  = 0.0f;
+    PanelLayoutItem m_laser_hit_item{};
+    bool        m_laser_hit_has_item = false;
+    PanelLayout m_main_menu_layout;
+    PanelLayout m_quick_panel_layout;
+    PanelLayout m_layer_panel_layout;
+    PanelLayout m_settings_panel_layout;
+    PanelLayout m_save_state_panel_layout;
+    PanelLayout m_code_panel_layout;
+    PanelLayout m_ctrlmap_panel_layout;
+    PanelLayout m_homebrew_panel_layout;
+
+    // ---------- Homebrew panel ----------
+    GLuint m_hw_tex         = 0;
+    int    m_hw_view        = 0;   // 0 = list, 1 = detail
+    int    m_hw_hovered     = -1;
+    int    m_hw_scroll      = 0;
+    int    m_hw_selected    = -1;
+    int    m_hw_feed        = 0;
+    bool   m_hw_dirty       = true;
+    bool   m_hw_loading     = false;
+    bool   m_hw_downloading = false;
+    XrTime m_last_hw_fire   = 0;
+    EnvironmentSphereSample m_environment_sphere_sample;
+    BlackoutRevealPhase m_blackout_reveal_phase = BlackoutRevealPhase::Normal;
+    int m_blackout_candidate_frames = 0;
+    int m_blackout_visible_frames = 0;
+    XrTime m_blackout_reveal_start_time = 0;
+    std::vector<std::string> m_blackout_reveal_layer_ids;
+
+    // Edit-mode laser state
+    XrVector3f  m_edit_laser_l_origin = {0,0,0};
+    XrVector3f  m_edit_laser_l_end    = {0,0,0};
+    XrVector3f  m_edit_laser_r_origin = {0,0,0};
+    XrVector3f  m_edit_laser_r_end    = {0,0,0};
+    // Left laser: reference aim direction at entry (for translation)
+    XrVector3f  m_edit_laim_ref_dir   = {0,0,-1};
+    bool        m_edit_laim_ref_valid  = false;
+    // Right laser: reference aim direction at entry (for sphere delta)
+    float       m_edit_raim_ref_az   = 0.0f;
+    float       m_edit_raim_ref_el   = 0.0f;
+    bool        m_edit_raim_ref_valid = false;
+
+    // ROM loader callback (set by main.cpp)
+    RomLoader m_rom_loader;
+
+    // ---------- Quick preset panel ----------
+    GLuint  m_quick_panel_tex       = 0;
+    bool    m_quick_panel_dirty     = true;
+    XrTime  m_last_quick_panel_fire = 0;
+    std::vector<QuickSettingsPreset> m_quick_settings_presets;
+    std::vector<QuickLayerPreset> m_quick_layer_presets;
+    bool    m_settings_return_to_quick = false;
+    bool    m_quick_preset_dialog_open = false;
+    int     m_pending_quick_preset_kind = -1;
+    int     m_pending_quick_preset_slot = -1;
+
+    // ---------- Layer order panel ----------
+    // Layer names/order/enabled are game-session state (not saved in presets)
+    std::vector<std::string> m_layer_names;
+    std::vector<int>         m_layer_order;   // m_layer_order[display_row] = original_idx
+    std::vector<bool>        m_layer_enabled;   // indexed by original_idx
+    std::vector<bool>        m_layer_ambilight; // indexed by original_idx
+    int     m_layer_auto_dup_percent = 75; // -1 = OFF, otherwise percentage target for farthest layer
+    LayerFilterMode m_layer_filter_mode = LayerFilterMode::Hybrid;
+    GLuint  m_layer_panel_tex     = 0;
+    bool    m_layer_panel_dirty   = true;
+    int     m_layer_panel_hovered = -1; // display row under laser
+    int     m_layer_panel_grabbed = -1; // display row being dragged (-1 = none)
+    int     m_layer_depth_selected = -1; // display row in depth-edit mode (-1 = none)
+    XrTime  m_last_layer_fire     = 0;
+    bool    m_emu_frozen_display  = false; // frozen state for play/pause button display
+    bool    m_auto_pause_ui_open_prev = false; // edge-detect for menu-open auto-pause
+    struct LayerModeSnapshot {
+        bool valid = false;
+        LayerFilterMode mode = LayerFilterMode::Hybrid;
+        GameConfig config;
+        std::vector<int> order;
+        std::vector<bool> enabled;
+        std::vector<bool> ambilight;
+    } m_saved_layer_mode_state;
+
+    // ---------- Settings panel ----------
+    GLuint  m_settings_panel_tex     = 0;
+    bool    m_settings_panel_dirty   = true;
+    int     m_settings_panel_hovered = -1;
+    int     m_settings_panel_area    = 0; // 0=none 1=minus 2=plus
+    XrTime  m_last_settings_fire     = 0;
+    std::vector<QueuedHapticEvent> m_pending_haptics;
+
+    // ---------- Save-state panel ----------
+    GLuint  m_save_state_panel_tex     = 0;
+    bool    m_save_state_panel_dirty   = true;
+    int     m_save_state_panel_hovered = -1; // 0-7 interactive cell/row
+    std::vector<SaveStateSlotInfo> m_save_state_slots;
+    int     m_autosave_interval_seconds = 30;
+    bool    m_load_last_save_enabled = true;
+    std::uint64_t m_last_autosave_time_ms = 0;
+    std::atomic<bool> m_autosave_in_progress{false};
+
+    // ---------- Code-input panel (floats above ROM browser) ----------
+    GLuint      m_code_panel_tex     = 0;
+    bool        m_code_panel_dirty   = true;
+    int         m_code_panel_hovered = -1; // index into k_code_keys (-1 = none)
+    XrTime      m_last_code_fire     = 0;
+    std::string m_code_input_buf;          // chars typed so far (≤ 20)
+    bool        m_code_panel_quick_name_mode = false;
+    MobilePanelBitmap m_main_menu_bitmap;
+    MobilePanelBitmap m_browser_bitmap;
+    MobilePanelBitmap m_layer_bitmap;
+    MobilePanelBitmap m_settings_bitmap;
+    MobilePanelBitmap m_save_state_bitmap;
+    MobilePanelBitmap m_code_bitmap;
+    MobilePanelBitmap m_ctrlmap_bitmap;
+    MobilePanelBitmap m_quick_bitmap;
+    MobilePanelBitmap m_help_bitmap;
+    MobilePanelBitmap m_homebrew_bitmap;
+    std::int64_t m_last_mobile_panel_refresh_ns = 0;
+
+    // ---------- Controller map panel ----------
+    GLuint  m_ctrlmap_panel_tex     = 0;
+    bool    m_ctrlmap_panel_dirty   = true;
+    int     m_ctrlmap_panel_hovered = -1; // row under laser (-1=none)
+    int     m_ctrlmap_selected_row  = -1; // row being remapped (-1=none)
+    ButtonMap m_button_map;               // current mapping (SNES→QuestInput)
+
+    // ---------- Passive side help panels ----------
+    GLuint      m_help_panel_tex   = 0;
+    bool        m_help_panel_dirty = true;
+    XrTime      m_last_help_fire   = 0;
+    std::string m_help_panel_key;
+
+    // Emulator freeze control callbacks (set by questretrodepth_main.cpp)
+    EmuFreezeCtrl m_emu_freeze_ctrl;
+    EmuStepOne    m_emu_step_one;
+    LayerCaptureMaskCtrl m_layer_capture_mask_ctrl;
+    SaveStateCapture m_save_state_capture;
+    SaveStateApply   m_save_state_apply;
+
+    // Pending changes requested from JNI thread
+    std::atomic<bool> m_randomize_pending{false};
+    std::atomic<int>  m_preset_load_pending{-1};
+    std::atomic<int>  m_preset_save_pending{-1};
+    std::atomic<int>  m_quick_settings_save_request_pending{-1};
+    std::atomic<int>  m_quick_layers_save_request_pending{-1};
+    std::atomic<int>  m_quick_settings_reset_pending{0};
+    std::atomic<int>  m_quick_layers_reset_pending{0};
+    std::atomic<int>  m_quick_named_save_kind_pending{-1};
+    std::atomic<int>  m_quick_named_save_slot_pending{-1};
+    std::string       m_quick_named_save_name; // guarded by m_mutex
+    // Share-code apply: store the code string guarded by m_mutex, then set flag
+    std::atomic<bool> m_apply_code_pending{false};
+    std::string       m_pending_code;          // guarded by m_mutex
+    // Settings I/O actions: 0=none, 1=save_game, 2=save_global, 3=load_game, 4=load_global, 5=reset
+    std::atomic<int>  m_settings_action_pending{0};
+    // Flag: load global settings on next XR frame (set at startup)
+    std::atomic<bool> m_load_global_pending{false};
+    // Flag: open main menu on first frame after session starts
+    std::atomic<bool> m_open_menu_on_startup{false};
+    // Flag: load game settings for the newly set ROM (set by set_current_rom)
+    std::atomic<bool> m_load_game_pending{false};
+    std::atomic<bool> m_autoload_latest_save_pending{false};
+    std::atomic<bool> m_request_open_menu{false};
+    std::atomic<bool> m_request_open_homebrew{false};
+
+    // Controller-driven input (written by XR thread, consumed by frame provider)
+    std::mutex         m_input_mutex;
+    EmulatorInputState m_input_state;
+
+    // Cached emulator frame/layers. Updated only when the emulator publishes a
+    // new frame, so XR refreshes can reuse already processed Genesis layers.
+    FrameOutput             m_cached_frame_out;
+    uint64_t                m_cached_frame_seq = 0;
+    std::vector<LayerFrame> m_cached_layer_frames;
+    std::vector<LayerFrame*> m_render_layer_refs;
+
+    // Refresh rate (0 = use headset default; otherwise Hz e.g. 72, 90, 120)
+    float  m_desired_refresh_rate = 0.0f;
+    std::atomic<bool> m_apply_refresh_pending{false};
+
+    // Rate-limiting (nanoseconds wall-clock via XrTime)
+    XrTime m_last_depth_fire  = 0;
+    XrTime m_last_browser_row_scroll_fire = 0;
+    XrTime m_last_browser_page_scroll_fire = 0;
+    XrTime m_last_width_fire  = 0;
+    XrTime m_last_copy_fire   = 0;
+    bool   m_lstick_click_prev = false;
+    bool   m_rstick_click_prev = false;
+    XrTime m_rclick_press_time = 0;   // XrTime when right stick click began (0 = not held)
+
+    // Edit mode — toggled by left thumbstick click
+    bool  m_edit_mode = false;
+    // Canvas state at the moment edit was entered
+    float m_edit_canvas_x = 0.0f;
+    float m_edit_canvas_y = 0.0f;
+    float m_edit_canvas_az = 0.0f; // azimuth (radians, right = positive)
+    float m_edit_canvas_el = 0.0f; // elevation (radians, up = positive)
+    // Live canvas placement (persists across edit sessions)
+    float m_canvas_x  = 0.0f; // horizontal offset from centre (metres)
+    float m_canvas_y  = 0.0f; // vertical offset from floor level (metres)
+    float m_canvas_az = 0.0f; // horizontal arc angle (radians)
+    float m_canvas_el = 0.0f; // vertical arc angle (radians)
+    float m_canvas_scale = 1.0f; // screen size multiplier at the same depth
+    // Predicted display time for the current frame (used to locate controllers)
+    XrTime m_frame_predicted_time = 0;
+    // Auto-recenter once on first valid HMD pose
+    bool   m_initial_recenter_done = false;
+
+    // ---------- OpenXR / EGL / GL resources (opaque impl) ----------
+    struct Impl;
+    Impl* m_impl = nullptr;
+};
+
+} // namespace qrd
